@@ -1,0 +1,131 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  ACR_NAME: "$(ACR_NAME)"                          # set in pipeline variables
+  IMAGE_NAME: "rag-chatbot"
+  IMAGE_TAG: "$(Build.BuildId)"
+  CONTAINER_APP_NAME: "$(CONTAINER_APP_NAME)"
+  RESOURCE_GROUP: "$(RESOURCE_GROUP)"
+
+stages:
+
+  # ------------------------------------------------------------------ #
+  # Stage 1: Test                                                        #
+  # ------------------------------------------------------------------ #
+  - stage: Test
+    displayName: "Run Tests"
+    jobs:
+      - job: UnitTests
+        displayName: "Unit Tests"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.11"
+
+          - script: |
+              pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: "Install dependencies"
+
+          - script: |
+              pytest tests/ -v --tb=short
+            displayName: "Run pytest"
+            env:
+              OPENAI_API_KEY: $(OPENAI_API_KEY)
+
+  # ------------------------------------------------------------------ #
+  # Stage 2: Build & Push Docker image                                   #
+  # ------------------------------------------------------------------ #
+  - stage: Build
+    displayName: "Build & Push Image"
+    dependsOn: Test
+    condition: succeeded()
+    jobs:
+      - job: DockerBuild
+        displayName: "Docker build + push to ACR"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: Docker@2
+            displayName: "Build and push image"
+            inputs:
+              command: buildAndPush
+              containerRegistry: "$(ACR_SERVICE_CONNECTION)"
+              repository: "$(IMAGE_NAME)"
+              dockerfile: Dockerfile
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+  # ------------------------------------------------------------------ #
+  # Stage 3: Evaluate RAG quality gates                                  #
+  # ------------------------------------------------------------------ #
+  - stage: Evaluate
+    displayName: "RAG Quality Gates"
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - job: EvalJob
+        displayName: "Run eval suite"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.11"
+
+          - script: |
+              pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: "Install dependencies"
+
+          - script: |
+              python -m app.evaluation.eval_runner \
+                --dataset data/eval_dataset.json \
+                --variants default verbose \
+                --output $(Build.ArtifactStagingDirectory)/eval_results.json
+            displayName: "Run evaluation"
+            env:
+              OPENAI_API_KEY: $(OPENAI_API_KEY)
+              VECTOR_STORE_TYPE: faiss
+              FAISS_INDEX_PATH: data/faiss_index
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)/eval_results.json"
+              ArtifactName: "eval-results"
+
+  # ------------------------------------------------------------------ #
+  # Stage 4: Deploy to Azure Container Apps                              #
+  # ------------------------------------------------------------------ #
+  - stage: Deploy
+    displayName: "Deploy to Azure"
+    dependsOn: Evaluate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployContainerApp
+        displayName: "Update Container App"
+        environment: production
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: "Update container image"
+                  inputs:
+                    azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az containerapp update \
+                        --name $(CONTAINER_APP_NAME) \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --image $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(IMAGE_TAG)

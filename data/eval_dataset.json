@@ -1,0 +1,12 @@
+[
+  {
+    "question": "What is the main topic of the document?",
+    "reference_answer": "Replace this with the actual expected answer from your PDF.",
+    "relevant_sources": ["your_document.pdf"]
+  },
+  {
+    "question": "Summarize the key findings.",
+    "reference_answer": "Replace this with the actual expected answer from your PDF.",
+    "relevant_sources": ["your_document.pdf"]
+  }
+]
